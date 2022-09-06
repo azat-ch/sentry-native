@@ -12,6 +12,14 @@
 
 #define ALIGN 8
 
+#define __msan_unpoison(X, Y) // NOLINT
+#if defined(__has_feature)
+#    if __has_feature(memory_sanitizer)
+#        undef __msan_unpoison
+#        include <sanitizer/msan_interface.h>
+#    endif
+#endif
+
 struct page_header;
 struct page_header {
     struct page_header *next;
@@ -60,11 +68,7 @@ get_pages(size_t num_pages)
         return NULL;
     }
 
-#if defined(__has_feature)
-#    if __has_feature(memory_sanitizer)
     __msan_unpoison(rv, g_alloc->page_size * num_pages);
-#    endif
-#endif
 
     struct page_header *header = (struct page_header *)rv;
     header->next = g_alloc->last_page;
