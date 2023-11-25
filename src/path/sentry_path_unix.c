@@ -5,18 +5,22 @@
 #include "sentry_utils.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/errno.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef SENTRY_PLATFORM_DARWIN
 #    include <mach-o/dyld.h>
+#endif
+
+#ifdef SENTRY_PLATFORM_AIX
+#    include <procinfo.h>
 #endif
 
 // only read this many bytes to memory ever
@@ -50,7 +54,7 @@ sentry__filelock_try_lock(sentry_filelock_t *lock)
 {
     lock->is_locked = false;
 
-    int fd = open(lock->path->path, O_RDONLY | O_CREAT | O_TRUNC,
+    int fd = open(lock->path->path, O_RDWR | O_CREAT | O_TRUNC,
         S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
     if (fd < 0) {
         return false;
@@ -130,6 +134,18 @@ sentry__path_current_exe(void)
     }
     buf[len] = 0;
     return sentry__path_from_str(buf);
+#elif defined(SENTRY_PLATFORM_AIX)
+    // You can't get the full path to the current executable; the best is
+    // either argv[0], or getting the name of the current executable, which
+    // doesn't even include a path. Let's go with that for now.
+    // (Actually, AIX may be able to under procfs, but it's System V style,
+    // not like Linux. And it's not available under PASE anyways.)
+    struct procentry64 proc;
+    pid_t pid = getpid();
+    if (getprocs64(&proc, sizeof(proc), NULL, 0, &pid, 1) < 1) {
+        return NULL;
+    }
+    return sentry__path_from_str(proc.pi_comm);
 #endif
     return NULL;
 }
@@ -153,14 +169,20 @@ sentry__path_dir(const sentry_path_t *path)
 }
 
 sentry_path_t *
-sentry__path_from_str(const char *s)
+sentry__path_from_str_n(const char *s, size_t s_len)
 {
-    char *path = sentry__string_clone(s);
+    char *path = sentry__string_clone_n(s, s_len);
     if (!path) {
         return NULL;
     }
     // NOTE: function will free `path` on error
     return sentry__path_from_str_owned(path);
+}
+
+sentry_path_t *
+sentry__path_from_str(const char *s)
+{
+    return s ? sentry__path_from_str_n(s, strlen(s)) : NULL;
 }
 
 sentry_path_t *
@@ -191,8 +213,8 @@ sentry__path_filename_matches(const sentry_path_t *path, const char *filename)
 bool
 sentry__path_ends_with(const sentry_path_t *path, const char *suffix)
 {
-    int pathlen = strlen(path->path);
-    int suffixlen = strlen(suffix);
+    size_t pathlen = strlen(path->path);
+    size_t suffixlen = strlen(suffix);
     if (suffixlen > pathlen) {
         return false;
     }
@@ -307,7 +329,7 @@ sentry__path_create_dir_all(const sentry_path_t *path)
 #define _TRY_MAKE_DIR                                                          \
     do {                                                                       \
         int mrv = mkdir(p, 0700);                                              \
-        if (mrv != 0 && errno != EEXIST) {                                     \
+        if (mrv != 0 && errno != EEXIST && errno != EINVAL) {                  \
             rv = 1;                                                            \
             goto done;                                                         \
         }                                                                      \
@@ -452,7 +474,9 @@ write_buffer_with_flags(
     int fd = open(
         path->path, flags, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH);
     if (fd < 0) {
-        SENTRY_TRACEF("failed to open file \"%s\" for writing", path->path);
+        SENTRY_TRACEF(
+            "failed to open file \"%s\" for writing (errno %d, flags %x)",
+            path->path, errno, flags);
         return 1;
     }
 

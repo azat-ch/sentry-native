@@ -23,6 +23,11 @@ extern "C" {
 
 #ifdef SENTRY_PLATFORM_WINDOWS
 #    include "client/windows/handler/exception_handler.h"
+#elif defined(SENTRY_PLATFORM_MACOS)
+#    include "client/mac/handler/exception_handler.h"
+#    include <sys/sysctl.h>
+#elif defined(SENTRY_PLATFORM_IOS)
+#    include "client/ios/exception_handler_no_mach.h"
 #else
 #    include "client/linux/handler/exception_handler.h"
 #endif
@@ -35,8 +40,12 @@ extern "C" {
 static bool
 sentry__breakpad_backend_callback(const wchar_t *breakpad_dump_path,
     const wchar_t *minidump_id, void *UNUSED(context),
-    EXCEPTION_POINTERS *UNUSED(exinfo), MDRawAssertionInfo *UNUSED(assertion),
+    EXCEPTION_POINTERS *exinfo, MDRawAssertionInfo *UNUSED(assertion),
     bool succeeded)
+#elif defined(SENTRY_PLATFORM_DARWIN)
+static bool
+sentry__breakpad_backend_callback(const char *breakpad_dump_path,
+    const char *minidump_id, void *UNUSED(context), bool succeeded)
 #else
 static bool
 sentry__breakpad_backend_callback(
@@ -72,49 +81,79 @@ sentry__breakpad_backend_callback(
     tmp_path = dump_path;
     dump_path = sentry__path_append_str(tmp_path, ".dmp");
     sentry__path_free(tmp_path);
+#elif defined(SENTRY_PLATFORM_DARWIN)
+    sentry_path_t *tmp_path = sentry__path_new(breakpad_dump_path);
+    dump_path = sentry__path_join_str(tmp_path, minidump_id);
+    sentry__path_free(tmp_path);
+    tmp_path = dump_path;
+    dump_path = sentry__path_append_str(tmp_path, ".dmp");
+    sentry__path_free(tmp_path);
 #else
     dump_path = sentry__path_new(descriptor.path());
 #endif
+    sentry_value_t event = sentry_value_new_event();
+    sentry_value_set_by_key(
+        event, "level", sentry__value_new_level(SENTRY_LEVEL_FATAL));
 
     SENTRY_WITH_OPTIONS (options) {
         sentry__write_crash_marker(options);
 
-        sentry_value_t event = sentry_value_new_event();
-        sentry_envelope_t *envelope
-            = sentry__prepare_event(options, event, NULL);
-        // the event we just prepared is empty, so no error is recorded for it
-        sentry__record_errors_on_current_session(1);
-        sentry_session_t *session = sentry__end_current_session_with_status(
-            SENTRY_SESSION_STATUS_CRASHED);
-        sentry__envelope_add_session(envelope, session);
+        bool should_handle = true;
 
-        // the minidump is added as an attachment, with type `event.minidump`
-        sentry_envelope_item_t *item
-            = sentry__envelope_add_from_path(envelope, dump_path, "attachment");
-        if (item) {
-            sentry__envelope_item_set_header(item, "attachment_type",
-                sentry_value_new_string("event.minidump"));
+        if (options->on_crash_func) {
+            sentry_ucontext_t *uctx = nullptr;
 
-            sentry__envelope_item_set_header(item, "filename",
 #ifdef SENTRY_PLATFORM_WINDOWS
-                sentry__value_new_string_from_wstr(
-#else
-                sentry_value_new_string(
+            sentry_ucontext_t uctx_data;
+            uctx_data.exception_ptrs = *exinfo;
+            uctx = &uctx_data;
 #endif
-                    sentry__path_filename(dump_path)));
+
+            SENTRY_TRACE("invoking `on_crash` hook");
+            sentry_value_t result
+                = options->on_crash_func(uctx, event, options->on_crash_data);
+            should_handle = !sentry_value_is_null(result);
         }
 
-        // capture the envelope with the disk transport
-        sentry_transport_t *disk_transport
-            = sentry_new_disk_transport(options->run);
-        sentry__capture_envelope(disk_transport, envelope);
-        sentry__transport_dump_queue(disk_transport, options->run);
-        sentry_transport_free(disk_transport);
+        if (should_handle) {
+            sentry_envelope_t *envelope = sentry__prepare_event(
+                options, event, nullptr, !options->on_crash_func);
+            sentry_session_t *session = sentry__end_current_session_with_status(
+                SENTRY_SESSION_STATUS_CRASHED);
+            sentry__envelope_add_session(envelope, session);
 
-        // now that the envelope was written, we can remove the temporary
-        // minidump file
-        sentry__path_remove(dump_path);
-        sentry__path_free(dump_path);
+            // the minidump is added as an attachment,
+            // with type `event.minidump`
+            sentry_envelope_item_t *item = sentry__envelope_add_from_path(
+                envelope, dump_path, "attachment");
+            if (item) {
+                sentry__envelope_item_set_header(item, "attachment_type",
+                    sentry_value_new_string("event.minidump"));
+
+                sentry__envelope_item_set_header(item, "filename",
+#ifdef SENTRY_PLATFORM_WINDOWS
+                    sentry__value_new_string_from_wstr(
+#else
+                    sentry_value_new_string(
+#endif
+                        sentry__path_filename(dump_path)));
+            }
+
+            // capture the envelope with the disk transport
+            sentry_transport_t *disk_transport
+                = sentry_new_disk_transport(options->run);
+            sentry__capture_envelope(disk_transport, envelope);
+            sentry__transport_dump_queue(disk_transport, options->run);
+            sentry_transport_free(disk_transport);
+
+            // now that the envelope was written, we can remove the temporary
+            // minidump file
+            sentry__path_remove(dump_path);
+            sentry__path_free(dump_path);
+        } else {
+            SENTRY_TRACE("event was discarded by the `on_crash` hook");
+            sentry_value_decref(event);
+        }
 
         // after capturing the crash event, try to dump all the in-flight
         // data of the previous transports
@@ -129,6 +168,40 @@ sentry__breakpad_backend_callback(
     return succeeded;
 }
 
+#ifdef SENTRY_PLATFORM_MACOS
+/**
+ * Returns true if the current process is being debugged (either running under
+ * the debugger or has a debugger attached post facto).
+ */
+static bool
+IsDebuggerActive()
+{
+    int junk;
+    int mib[4];
+    struct kinfo_proc info;
+    size_t size;
+
+    // Initialize the flags so that, if sysctl fails for some bizarre
+    // reason, we get a predictable result.
+    info.kp_proc.p_flag = 0;
+
+    // Initialize mib, which tells sysctl the info we want, in this case
+    // we're looking for information about a specific process ID.
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_PROC;
+    mib[2] = KERN_PROC_PID;
+    mib[3] = getpid();
+
+    // Call sysctl.
+    size = sizeof(info);
+    junk = sysctl(mib, sizeof(mib) / sizeof(*mib), &info, &size, NULL, 0);
+    assert(junk == 0);
+
+    // We're being debugged if the P_TRACED flag is set.
+    return ((info.kp_proc.p_flag & P_TRACED) != 0);
+}
+#endif
+
 static int
 sentry__breakpad_backend_startup(
     sentry_backend_t *backend, const sentry_options_t *options)
@@ -139,6 +212,16 @@ sentry__breakpad_backend_startup(
     backend->data = new google_breakpad::ExceptionHandler(
         current_run_folder->path, NULL, sentry__breakpad_backend_callback, NULL,
         google_breakpad::ExceptionHandler::HANDLER_EXCEPTION);
+#elif defined(SENTRY_PLATFORM_MACOS)
+    // If process is being debugged and there are breakpoints set it will cause
+    // task_set_exception_ports to crash the whole process and debugger
+    backend->data
+        = new google_breakpad::ExceptionHandler(current_run_folder->path, NULL,
+            sentry__breakpad_backend_callback, NULL, !IsDebuggerActive(), NULL);
+#elif defined(SENTRY_PLATFORM_IOS)
+    backend->data
+        = new google_breakpad::ExceptionHandler(current_run_folder->path, NULL,
+            sentry__breakpad_backend_callback, NULL, true, NULL);
 #else
     google_breakpad::MinidumpDescriptor descriptor(current_run_folder->path);
     backend->data = new google_breakpad::ExceptionHandler(
@@ -166,6 +249,17 @@ sentry__breakpad_backend_except(
 #ifdef SENTRY_PLATFORM_WINDOWS
     eh->WriteMinidumpForException(
         const_cast<EXCEPTION_POINTERS *>(&context->exception_ptrs));
+#elif defined(SENTRY_PLATFORM_MACOS)
+    (void)context;
+    eh->WriteMinidump(true);
+    // currently private:
+    // eh->SignalHandler(context->signum, context->siginfo,
+    // context->user_context);
+#elif defined(SENTRY_PLATFORM_IOS)
+    // the APIs are currently private
+    (void)eh;
+    (void)backend;
+    (void)context;
 #else
     eh->HandleSignal(context->signum, context->siginfo, context->user_context);
 #endif
@@ -180,15 +274,11 @@ sentry__backend_new(void)
     if (!backend) {
         return NULL;
     }
+    memset(backend, 0, sizeof(sentry_backend_t));
 
     backend->startup_func = sentry__breakpad_backend_startup;
     backend->shutdown_func = sentry__breakpad_backend_shutdown;
     backend->except_func = sentry__breakpad_backend_except;
-    backend->free_func = NULL;
-    backend->flush_scope_func = NULL;
-    backend->add_breadcrumb_func = NULL;
-    backend->user_consent_changed_func = NULL;
-    backend->data = NULL;
 
     return backend;
 }

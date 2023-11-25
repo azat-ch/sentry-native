@@ -3,6 +3,10 @@
 
 #include "sentry_boot.h"
 
+#ifdef SENTRY_PLATFORM_DARWIN
+#    include <mach/clock.h>
+#    include <mach/mach.h>
+#endif
 #ifdef SENTRY_PLATFORM_WINDOWS
 #    include <winnt.h>
 #else
@@ -45,7 +49,7 @@ typedef struct sentry_dsn_s {
     char *path;
     char *secret_key;
     char *public_key;
-    uint64_t project_id;
+    char *project_id;
     int port;
     long refcount;
     bool is_valid;
@@ -59,6 +63,7 @@ typedef struct sentry_dsn_s {
  * DSN has been successfully parsed.
  */
 sentry_dsn_t *sentry__dsn_new(const char *dsn);
+sentry_dsn_t *sentry__dsn_new_n(const char *dsn, size_t raw_dsn_len);
 
 /**
  * Increases the reference-count of the DSN.
@@ -75,7 +80,8 @@ void sentry__dsn_decref(sentry_dsn_t *dsn);
  * described here:
  * https://docs.sentry.io/development/sdk-dev/overview/#authentication
  */
-char *sentry__dsn_get_auth_header(const sentry_dsn_t *dsn);
+char *sentry__dsn_get_auth_header(
+    const sentry_dsn_t *dsn, const char *user_agent);
 
 /**
  * Returns the envelope endpoint url used for normal uploads as a newly
@@ -87,7 +93,8 @@ char *sentry__dsn_get_envelope_url(const sentry_dsn_t *dsn);
  * Returns the minidump endpoint url used for uploads done by the out-of-process
  * crashpad backend as a newly allocated string.
  */
-char *sentry__dsn_get_minidump_url(const sentry_dsn_t *dsn);
+char *sentry__dsn_get_minidump_url(
+    const sentry_dsn_t *dsn, const char *user_agent);
 
 /**
  * Returns the number of milliseconds since the unix epoch.
@@ -127,7 +134,7 @@ static inline uint64_t
 sentry__monotonic_time(void)
 {
 #ifdef SENTRY_PLATFORM_WINDOWS
-    static LARGE_INTEGER qpc_frequency = { 0 };
+    static LARGE_INTEGER qpc_frequency = { { 0, 0 } };
 
     if (!qpc_frequency.QuadPart) {
         QueryPerformanceFrequency(&qpc_frequency);
@@ -145,6 +152,25 @@ sentry__monotonic_time(void)
     LARGE_INTEGER qpc_counter;
     QueryPerformanceCounter(&qpc_counter);
     return qpc_counter.QuadPart * 1000 / qpc_frequency.QuadPart;
+#elif defined(SENTRY_PLATFORM_DARWIN)
+
+// try `clock_gettime` first if available,
+// fall back to `host_get_clock_service` otherwise
+#    if defined(MAC_OS_X_VERSION_10_12) && __has_builtin(__builtin_available)
+    if (__builtin_available(macOS 10.12, *)) {
+        struct timespec tv;
+        return (clock_gettime(CLOCK_MONOTONIC, &tv) == 0)
+            ? (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000000
+            : 0;
+    }
+#    endif
+
+    clock_serv_t cclock;
+    mach_timespec_t mts;
+    host_get_clock_service(mach_host_self(), CALENDAR_CLOCK, &cclock);
+    clock_get_time(cclock, &mts);
+    mach_port_deallocate(mach_task_self(), cclock);
+    return (uint64_t)mts.tv_sec * 1000 + mts.tv_nsec / 1000000;
 #else
     struct timespec tv;
     return (clock_gettime(CLOCK_MONOTONIC, &tv) == 0)
@@ -164,5 +190,31 @@ char *sentry__msec_time_to_iso8601(uint64_t time);
  * produced by the `sentry__msec_time_to_iso8601` function.
  */
 uint64_t sentry__iso8601_to_msec(const char *iso);
+
+/**
+ * Locale independent (or rather, using "C" locale) `strtod`.
+ */
+double sentry__strtod_c(const char *ptr, char **endptr);
+
+/**
+ * Locale independent (or rather, using "C" locale) `snprintf`.
+ */
+int sentry__snprintf_c(char *buf, size_t buf_size, const char *fmt, ...);
+
+/**
+ * Represents a version of a software artifact.
+ */
+typedef struct {
+    unsigned int major;
+    unsigned int minor;
+    unsigned int patch;
+} sentry_version_t;
+
+/**
+ * Checks whether `actual` is the same or a later version than `expected`.
+ * Returns `true` if that is the case.
+ */
+bool sentry__check_min_version(
+    sentry_version_t actual, sentry_version_t expected);
 
 #endif

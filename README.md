@@ -1,23 +1,26 @@
+[![Conan Center](https://shields.io/conan/v/sentry-native)](https://conan.io/center/recipes/sentry-native) [![nixpkgs unstable](https://repology.org/badge/version-for-repo/nix_unstable/sentry-native.svg)](https://github.com/NixOS/nixpkgs/blob/nixos-unstable/pkgs/development/libraries/sentry-native/default.nix) [![vcpkg](https://shields.io/vcpkg/v/sentry-native)](https://vcpkg.link/ports/sentry-native)
+
 <p align="center">
-  <a href="https://sentry.io" target="_blank" align="center">
-    <img src="https://sentry-brand.storage.googleapis.com/sentry-logo-black.png" width="280">
+  <a href="https://sentry.io/?utm_source=github&utm_medium=logo" target="_blank">
+    <picture>
+      <source srcset="https://sentry-brand.storage.googleapis.com/sentry-logo-white.png" media="(prefers-color-scheme: dark)" />
+      <source srcset="https://sentry-brand.storage.googleapis.com/sentry-logo-black.png" media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)" />
+      <img src="https://sentry-brand.storage.googleapis.com/sentry-logo-black.png" alt="Sentry" width="280">
+    </picture>
   </a>
-  <br />
 </p>
 
 # Official Sentry SDK for C/C++ <!-- omit in toc -->
 
 The _Sentry Native SDK_ is an error and crash reporting client for native
 applications, optimized for C and C++. Sentry allows to add tags, breadcrumbs
-and arbitrary custom context to enrich error reports.
+and arbitrary custom context to enrich error reports. Supports Sentry _20.6.0_
+and later.
 
-**Note**: This SDK is being actively developed and still in Beta. We recommend
-to check for updates regularly to benefit from latest features and bug fixes.
-Please see [Known Limitations](#known-limitations).
+## Resources <!-- omit in toc -->
 
-## Resources
-
-- [Discord](https://discord.gg/ez5KZN7) server for project discussions.
+- [SDK Documentation](https://docs.sentry.io/platforms/native/)
+- [Discord](https://discord.gg/ez5KZN7) server for project discussions
 - Follow [@getsentry](https://twitter.com/getsentry) on Twitter for updates
 
 ## Table of Contents <!-- omit in toc -->
@@ -28,6 +31,7 @@ Please see [Known Limitations](#known-limitations).
 - [Building and Installation](#building-and-installation)
   - [Compile-Time Options](#compile-time-options)
   - [Build Targets](#build-targets)
+- [Runtime Configuration](#runtime-configuration)
 - [Known Limitations](#known-limitations)
 - [Development](#development)
 
@@ -56,8 +60,8 @@ The SDK currently supports and is tested on the following OS/Compiler variations
 - 64bit Linux with GCC 9
 - 64bit Linux with clang 9
 - 32bit Linux with GCC 7 (cross compiled from 64bit host)
-- 64bit Windows with MSVC 2019
-- 32bit Windows with MSVC 2017
+- 32bit Windows with MSVC 2019
+- 64bit Windows with MSVC 2022
 - macOS Catalina with most recent Compiler toolchain
 - Android API29 built by NDK21 toolchain
 - Android API16 built by NDK19 toolchain
@@ -74,7 +78,7 @@ The SDK supports different features on the target platform:
   have the `curl` library available. On other platforms, library users need to
   implement their own transport, based on the `function transport` API.
 - **Crashpad Backend** is currently only supported on Linux, Windows and macOS.
-- **Breakpad Backend** is currently only supported on Linux and Windows.
+- **Client-side stackwalking** is currently only supported on Linux, Windows, and macOS.
 
 ## Building and Installation
 
@@ -90,11 +94,11 @@ Building the Crashpad Backend requires a `C++14` compatible compiler.
 
 ```sh
 # configure the cmake build into the `build` directory, with crashpad (on macOS)
-$ cmake -B build -DSENTRY_BACKEND=crashpad
+$ cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 # build the project
 $ cmake --build build --parallel
 # install the resulting artifacts into a specific prefix (use the correct config on windows)
-$ cmake --install build --prefix install --config Debug
+$ cmake --install build --prefix install --config RelWithDebInfo
 # which will result in the following (on macOS):
 $ exa --tree install
 install
@@ -103,6 +107,8 @@ install
 ├── include
 │  └── sentry.h
 └── lib
+   ├── cmake
+   │  └── sentry
    ├── libsentry.dylib
    └── libsentry.dylib.dSYM
 ```
@@ -138,14 +144,44 @@ $ cmake -GNinja -Bbuild -H. -DCMAKE_TOOLCHAIN_FILE=toolchains/msys2.cmake
 $ ninja -C build
 ```
 
+**MacOS**:
+
+Building universal binaries/libraries is possible out of the box when using the
+[`CMAKE_OSX_ARCHITECTURES`](https://cmake.org/cmake/help/latest/variable/CMAKE_OSX_ARCHITECTURES.html) define, both with the `Xcode` generator as well
+as the default generator:
+
+```sh
+# using xcode generator:
+$ cmake -B xcodebuild -GXcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+$ xcodebuild build -project xcodebuild/Sentry-Native.xcodeproj
+$ lipo -info xcodebuild/Debug/libsentry.dylib
+Architectures in the fat file: xcodebuild/Debug/libsentry.dylib are: x86_64 arm64
+
+# using default generator:
+$ cmake -B defaultbuild -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+$ cmake --build defaultbuild --parallel
+$ lipo -info defaultbuild/libsentry.dylib
+Architectures in the fat file: defaultbuild/libsentry.dylib are: x86_64 arm64
+```
+
+Make sure that MacOSX SDK 11 or later is used. It is possible that this requires
+manually overriding the `SDKROOT`:
+
+```sh
+$ export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+```
+
 ### Compile-Time Options
 
 The following options can be set when running the cmake generator, for example
 using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
 
-- `BUILD_SHARED_LIBS` (Default: ON):
+- `SENTRY_BUILD_SHARED_LIBS` (Default: ON):
   By default, `sentry` is built as a shared library. Setting this option to
   `OFF` will build `sentry` as a static library instead.
+  If sentry is used as a subdirectory of another project, the value `BUILD_SHARED_LIBS` will be inherited by default.
+
+  When using `sentry` as a static library, make sure to `#define SENTRY_BUILD_STATIC 1` before including the sentry header.
 
 - `SENTRY_PIC` (Default: ON):
   By default, `sentry` is built as a position independent library.
@@ -157,7 +193,7 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
   Enables linking with the static MSVC runtime. Has no effect if the compiler is not MSVC.
 
 - `SENTRY_LINK_PTHREAD` (Default: ON):
-  Links to the `pthread` library on unix targets.
+  Links platform threads library like `pthread` on unix targets.
 
 - `SENTRY_BUILD_FORCE32` (Default: OFF):
   Forces cross-compilation from 64-bit host to 32-bit target. Only has an effect on Linux.
@@ -191,13 +227,16 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
   Sentry can use different backends depending on platform.
 
   - **crashpad**: This uses the out-of-process crashpad handler. It is currently
-    only supported on Windows and macOS, and used as the default there.
+    only supported on Desktop OSs, and used as the default on Windows and macOS.
   - **breakpad**: This uses the in-process breakpad handler. It is currently
-    only supported on Linux and Windows, and used as the default on Linux.
+    only supported on Desktop OSs, and used as the default on Linux.
   - **inproc**: A small in-process handler which is supported on all platforms,
     and is used as default on Android.
   - **none**: This builds `sentry-native` without a backend, so it does not handle
     crashes at all. It is primarily used for tests.
+
+- `SENTRY_INTEGRATION_QT` (Default: OFF):
+  Builds the Qt integration, which turns Qt log messages into breadcrumbs.
 
 - `SENTRY_BREAKPAD_SYSTEM` / `SENTRY_CRASHPAD_SYSTEM` (Default: OFF):
   This instructs the build system to use system-installed breakpad or crashpad
@@ -206,24 +245,37 @@ using `cmake -D BUILD_SHARED_LIBS=OFF ..`.
   This is being worked on upstream as well, and a future version might work with
   an unmodified crashpad version as well.
 
-| Feature    | Windows | macOS | Linux | Android |
-| ---------- | ------- | ----- | ----- | ------- |
-| Transports |         |       |       |         |
-| - curl     |         | ☑     | ☑     | (✓)     |
-| - winhttp  | ☑       |       |       |         |
-| - none     | ✓       | ✓     | ✓     | ☑       |
-|            |         |       |       |         |
-| Backends   |         |       |       |         |
-| - inproc   | ✓       | ✓     | ✓     | ☑       |
-| - crashpad | ☑       | ☑     | ✓     |         |
-| - breakpad | ✓       |       | ☑     |         |
-| - none     | ✓       | ✓     | ✓     | ✓       |
+| Feature    | Windows | macOS | Linux | Android | iOS |
+| ---------- | ------- | ----- | ----- | ------- | --- |
+| Transports |         |       |       |         |     |
+| - curl     |         | ☑     | ☑     | (✓)     |     |
+| - winhttp  | ☑       |       |       |         |     |
+| - none     | ✓       | ✓     | ✓     | ☑       | ☑   |
+|            |         |       |       |         |     |
+| Backends   |         |       |       |         |     |
+| - inproc   | ✓       | ✓     | ✓     | ☑       |     |
+| - crashpad | ☑       | ☑     | ✓     |         |     |
+| - breakpad | ✓       | ✓     | ☑     | (✓)     | (✓) |
+| - none     | ✓       | ✓     | ✓     | ✓       |     |
 
 Legend:
 
 - ☑ default
 - ✓ supported
 - unsupported
+
+- `SENTRY_FOLDER` (Default: not defined):
+  Sets the sentry-native projects folder name for generators which support project hierarchy (like Microsoft Visual Studio).
+  To use this feature you need to enable hierarchy via [`USE_FOLDERS` property](https://cmake.org/cmake/help/latest/prop_gbl/USE_FOLDERS.html)
+
+- `CRASHPAD_ENABLE_STACKTRACE` (Default: OFF):
+  This enables client-side stackwalking when using the crashpad backend. Stack unwinding will happen on the client's machine
+  and the result will be submitted to Sentry attached to the generated minidump.
+  Note that this feature is still experimental.
+
+- `SENTRY_SDK_NAME` (Default: sentry.native or sentry.native.android):
+  Sets the SDK name that should be included in the reported events. If you're overriding this, make sure to also define
+  the same value using `target_compile_definitions()` on your own targets that include `sentry.h`.
 
 ### Build Targets
 
@@ -237,12 +289,39 @@ Legend:
   can be controlled via command-line parameters, and is also used for
   integration tests.
 
+## Runtime Configuration
+
+A minimal working example looks like this. For a more elaborate example see the [example.c](examples/example.c) file which is also used to run sentries integration tests.
+
+```c
+sentry_options_t *options = sentry_options_new();
+sentry_options_set_dsn(options, "https://YOUR_KEY@oORG_ID.ingest.sentry.io/PROJECT_ID");
+sentry_init(options);
+
+// your application code …
+
+sentry_close();
+```
+
+Other important configuration options include:
+
+- `sentry_options_set_database_path`: Sentry needs to persist some cache data across application restarts, especially for proper handling of release health sessions. It is recommended to set an explicit absolute path corresponding to the applications cache directory (equivalent to `AppData/Local` on Windows, and `XDG_CACHE_HOME` on Linux). Sentry should be given its own directory which is not shared with other application data, as the SDK will enumerate and possibly delete files in that directory. An example might be `$XDG_CACHE_HOME/your-app/sentry`.
+  When not set explicitly, sentry will create and use the `.sentry-native` directory inside of the current working directory.
+- `sentry_options_set_handler_path`: When using the crashpad backend, sentry will look for a `crashpad_handler` executable in the same directory as the running executable. It is recommended to set this as an explicit absolute path based on the applications install location.
+- `sentry_options_set_release`: Some features in sentry, including release health, need to have a release version set. This corresponds to the application’s version and needs to be set explicitly. See [Releases](https://docs.sentry.io/product/releases/) for more information.
+
 ## Known Limitations
 
-- The crashpad backend currently has no support for notifying the crashing
+- The crashpad backend on macOS currently has no support for notifying the crashing
   process, and can thus not properly terminate sessions or call the registered
-  `before_send` hook. It will also lose any events that have been queued for
+  `before_send` or `on_crash` hook. It will also lose any events that have been queued for
   sending at time of crash.
+- The Crashpad backend on Windows supports fast-fail crashes, which bypass SEH (Structured
+  Exception Handling) primarily for security reasons. `sentry-native` registers a WER (Windows Error
+  Reporting) module, which signals the `crashpad_handler` to send a minidump when a fast-fail crash occurs
+  But since this process bypasses SEH, the application local exception handler is no longer invoked, which
+  also means that for these kinds of crashes, `before_send` and `on_crash` will not be invoked before
+  sending the minidump and thus have no effect.
 
 ## Development
 

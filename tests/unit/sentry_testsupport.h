@@ -13,12 +13,19 @@
 #include "../vendor/acutest.h"
 
 #define CONCAT(A, B) A##B
-#define SENTRY_TEST(Name) void CONCAT(test_sentry_, Name)(void **UNUSED(state))
+#define SENTRY_TEST(Name) void CONCAT(test_sentry_, Name)(void)
 #define SKIP_TEST() (void)0
 
 #define TEST_CHECK_STRING_EQUAL(Val, ReferenceVal)                             \
     do {                                                                       \
         TEST_CHECK(strcmp(Val, ReferenceVal) == 0);                            \
+        TEST_MSG("Expected: %s", ReferenceVal);                                \
+        TEST_MSG("Received: %s", Val);                                         \
+    } while (0)
+
+#define TEST_CHECK_WSTRING_EQUAL(Val, ReferenceVal)                            \
+    do {                                                                       \
+        TEST_CHECK(wcscmp(Val, ReferenceVal) == 0);                            \
         TEST_MSG("Expected: %s", ReferenceVal);                                \
         TEST_MSG("Received: %s", Val);                                         \
     } while (0)

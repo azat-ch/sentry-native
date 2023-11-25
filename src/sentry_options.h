@@ -4,6 +4,7 @@
 #include "sentry_boot.h"
 
 #include "sentry_logger.h"
+#include "sentry_session.h"
 #include "sentry_utils.h"
 
 // Defaults to 2s as per
@@ -36,9 +37,13 @@ typedef struct sentry_options_s {
     char *dist;
     char *http_proxy;
     char *ca_certs;
+    char *transport_thread_name;
+    char *sdk_name;
+    char *user_agent;
     sentry_path_t *database_path;
     sentry_path_t *handler_path;
     sentry_logger_t logger;
+    size_t max_breadcrumbs;
     bool debug;
     bool auto_session_tracking;
     bool require_user_consent;
@@ -51,13 +56,21 @@ typedef struct sentry_options_s {
     sentry_transport_t *transport;
     sentry_event_function_t before_send_func;
     void *before_send_data;
+    sentry_crash_function_t on_crash_func;
+    void *on_crash_data;
+
+    /* Experimentally exposed */
+    double traces_sample_rate;
+    size_t max_spans;
 
     /* everything from here on down are options which are stored here but
        not exposed through the options API */
     struct sentry_backend_s *backend;
+    sentry_session_t *session;
 
     long user_consent;
     long refcount;
+    uint64_t shutdown_timeout;
 } sentry_options_t;
 
 /**
