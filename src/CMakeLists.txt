@@ -10,13 +10,15 @@ sentry_target_sources_cwd(sentry
 	sentry_database.h
 	sentry_envelope.c
 	sentry_envelope.h
+	sentry_info.c
 	sentry_json.c
 	sentry_json.h
 	sentry_logger.c
 	sentry_logger.h
-	sentry_modulefinder.h
 	sentry_options.c
 	sentry_options.h
+	sentry_os.c
+	sentry_os.h
 	sentry_path.h
 	sentry_random.c
 	sentry_random.h
@@ -41,6 +43,8 @@ sentry_target_sources_cwd(sentry
 	sentry_uuid.h
 	sentry_value.c
 	sentry_value.h
+	sentry_tracing.c
+	sentry_tracing.h
 	path/sentry_path.c
 	transports/sentry_disk_transport.c
 	transports/sentry_disk_transport.h
@@ -79,6 +83,10 @@ elseif(LINUX OR ANDROID)
 	sentry_target_sources_cwd(sentry
 		modulefinder/sentry_modulefinder_linux.c
 	)
+elseif(AIX)
+	sentry_target_sources_cwd(sentry
+		modulefinder/sentry_modulefinder_aix.c
+	)
 endif()
 
 # transport
@@ -98,14 +106,17 @@ endif()
 
 # backends
 if(SENTRY_BACKEND_CRASHPAD)
+    target_compile_definitions(sentry PRIVATE SENTRY_BACKEND_CRASHPAD)
     sentry_target_sources_cwd(sentry
         backends/sentry_backend_crashpad.cpp
     )
 elseif(SENTRY_BACKEND_BREAKPAD)
+    target_compile_definitions(sentry PRIVATE SENTRY_BACKEND_BREAKPAD)
     sentry_target_sources_cwd(sentry
         backends/sentry_backend_breakpad.cpp
     )
 elseif(SENTRY_BACKEND_INPROC)
+    target_compile_definitions(sentry PRIVATE SENTRY_BACKEND_INPROC)
     sentry_target_sources_cwd(sentry
         backends/sentry_backend_inproc.c
     )
@@ -132,5 +143,14 @@ if(WIN32)
 	target_compile_definitions(sentry PRIVATE SENTRY_WITH_UNWINDER_DBGHELP)
 	sentry_target_sources_cwd(sentry
 		unwinder/sentry_unwinder_dbghelp.c
+	)
+endif()
+
+# integrations
+if(SENTRY_INTEGRATION_QT)
+	target_compile_definitions(sentry PRIVATE SENTRY_INTEGRATION_QT)
+	sentry_target_sources_cwd(sentry
+		integrations/sentry_integration_qt.cpp
+		integrations/sentry_integration_qt.h
 	)
 endif()

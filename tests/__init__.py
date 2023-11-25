@@ -5,6 +5,8 @@ import json
 import sys
 import urllib
 import pytest
+import pprint
+import textwrap
 
 sourcedir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
@@ -20,7 +22,13 @@ def make_dsn(httpserver, auth="uiaeosnrtdy", id=123456):
     # after a timeout of 2 seconds, falling back to the ipv4 loopback instead.
     host = url.netloc.replace("localhost", "127.0.0.1")
     return urllib.parse.urlunsplit(
-        (url.scheme, "{}@{}".format(auth, host), url.path, url.query, url.fragment,)
+        (
+            url.scheme,
+            "{}@{}".format(auth, host),
+            url.path,
+            url.query,
+            url.fragment,
+        )
     )
 
 
@@ -64,6 +72,9 @@ def run(cwd, exe, args, env=dict(os.environ), **kwargs):
     ]
     if "asan" in os.environ.get("RUN_ANALYZER", ""):
         env["ASAN_OPTIONS"] = "detect_leaks=1"
+        env["LSAN_OPTIONS"] = "suppressions={}".format(
+            os.path.join(sourcedir, "tests", "leaks.txt")
+        )
     if "llvm-cov" in os.environ.get("RUN_ANALYZER", ""):
         # continuous mode is only supported on mac right now
         continuous = "%c" if sys.platform == "darwin" else ""
@@ -77,7 +88,15 @@ def run(cwd, exe, args, env=dict(os.environ), **kwargs):
             *cmd,
         ]
     if "valgrind" in os.environ.get("RUN_ANALYZER", ""):
-        cmd = ["valgrind", "--leak-check=yes", *cmd]
+        cmd = [
+            "valgrind",
+            "--suppressions={}".format(
+                os.path.join(sourcedir, "tests", "valgrind.txt")
+            ),
+            "--error-exitcode=33",
+            "--leak-check=yes",
+            *cmd,
+        ]
     try:
         return subprocess.run([*cmd, *args], cwd=cwd, env=env, **kwargs)
     except subprocess.CalledProcessError:
@@ -148,6 +167,19 @@ class Envelope(object):
         # type: (...) -> Envelope
         return cls.deserialize_from(io.BytesIO(bytes))
 
+    def print_verbose(self, indent=0):
+        """Pretty prints the envelope."""
+        print(" " * indent + "Envelope:")
+        indent += 2
+        print(" " * indent + "Headers:")
+        indent += 2
+        print(textwrap.indent(pprint.pformat(self.headers), " " * indent))
+        indent -= 2
+        print(" " * indent + "Items:")
+        indent += 2
+        for item in self.items:
+            item.print_verbose(indent)
+
     def __repr__(self):
         # type: (...) -> str
         return "<Envelope headers=%r items=%r>" % (self.headers, self.items)
@@ -162,6 +194,21 @@ class PayloadRef(object):
         # type: (...) -> None
         self.json = json
         self.bytes = bytes
+
+    def print_verbose(self, indent=0):
+        """Pretty prints the item."""
+        print(" " * indent + "Payload:")
+        indent += 2
+        if self.bytes:
+            payload = self.bytes.encode("utf-8", errors="replace")
+        if self.json:
+            payload = pprint.pformat(self.json)
+        try:
+            print(textwrap.indent(payload, " " * indent))
+        except UnicodeEncodeError:
+            # Windows CI appears fickle, and we put emojis in the json
+            payload = payload.encode("ascii", errors="replace").decode()
+            print(textwrap.indent(payload, " " * indent))
 
     def __repr__(self):
         # type: (...) -> str
@@ -188,7 +235,11 @@ class Item(object):
 
     def get_event(self):
         # type: (...) -> Optional[Event]
-        if self.headers.get("type") == "event" and self.payload.json is not None:
+        # Transactions are events with a few extra fields, so return them as well.
+        if (
+            self.headers.get("type") in ["event", "transaction"]
+            and self.payload.json is not None
+        ):
             return self.payload.json
         return None
 
@@ -203,7 +254,7 @@ class Item(object):
         headers = json.loads(line)
         length = headers["length"]
         payload = f.read(length)
-        if headers.get("type") == "event" or headers.get("type") == "session":
+        if headers.get("type") in ["event", "session", "transaction"]:
             rv = cls(headers=headers, payload=PayloadRef(json=json.loads(payload)))
         else:
             rv = cls(headers=headers, payload=payload)
@@ -217,6 +268,21 @@ class Item(object):
         # type: (...) -> Optional[Item]
         return cls.deserialize_from(io.BytesIO(bytes))
 
+    def print_verbose(self, indent=0):
+        """Pretty prints the item."""
+        item_type = self.headers.get("type", "?").capitalize()
+        print(" " * indent + f"{item_type}:")
+        indent += 2
+        print(" " * indent + "Headers:")
+        indent += 2
+        headers = pprint.pformat(self.headers)
+        print(textwrap.indent(headers, " " * indent))
+        indent -= 2
+        self.payload.print_verbose(indent)
+
     def __repr__(self):
         # type: (...) -> str
-        return "<Item headers=%r payload=%r>" % (self.headers, self.payload,)
+        return "<Item headers=%r payload=%r>" % (
+            self.headers,
+            self.payload,
+        )

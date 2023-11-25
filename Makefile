@@ -1,7 +1,7 @@
 all: test
 
 update-test-discovery:
-	@perl -ne 'print if s/SENTRY_TEST\(([^)]+)\)/XX(\1)/' tests/unit/*.c | sort | uniq > tests/unit/tests.inc
+	@perl -ne 'print if s/SENTRY_TEST\(([^)]+)\)/XX(\1)/' tests/unit/*.c | sort | grep -v define | uniq > tests/unit/tests.inc
 .PHONY: update-test-discovery
 
 build/Makefile: CMakeLists.txt
@@ -12,11 +12,18 @@ build: build/Makefile
 	@cmake --build build --parallel
 .PHONY: build
 
-build/sentry_test_unit: build
-	@cmake --build build --target sentry_test_unit --parallel
-
 test: update-test-discovery test-integration
 .PHONY: test
+
+test-unit: update-test-discovery CMakeLists.txt
+	@mkdir -p unit-build
+	@cd unit-build; cmake \
+		-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$(PWD)/unit-build \
+		-DSENTRY_BACKEND=none \
+		..
+	@cmake --build unit-build --target sentry_test_unit --parallel
+	./unit-build/sentry_test_unit
+.PHONY: test-unit
 
 test-integration: setup-venv
 	.venv/bin/pytest tests --verbose
@@ -55,8 +62,7 @@ setup-venv: .venv/bin/python
 
 .venv/bin/python: Makefile tests/requirements.txt
 	@rm -rf .venv
-	@which virtualenv || sudo pip install virtualenv
-	virtualenv -p python3 .venv
+	python3 -m venv .venv
 	.venv/bin/pip install --upgrade --requirement tests/requirements.txt
 
 format: setup-venv
@@ -77,3 +83,9 @@ style: setup-venv
 	@.venv/bin/python ./scripts/check-clang-format.py -r examples include src tests/unit
 	@.venv/bin/black --diff --check tests
 .PHONY: style
+
+# TODO: workaround for clang-format 15+ where local formatting breaks with clang-format-14 based style checks on CI
+style-15: setup-venv
+	@.venv/bin/python ./scripts/check-clang-format.py --clang-format-executable /usr/bin/clang-format-15 -r examples include src tests/unit
+	@.venv/bin/black --diff --check tests
+.PHONY: style-15

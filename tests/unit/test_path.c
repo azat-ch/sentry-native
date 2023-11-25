@@ -1,7 +1,6 @@
 #include "sentry_path.h"
 #include "sentry_string.h"
 #include "sentry_testsupport.h"
-#include <sentry.h>
 
 SENTRY_TEST(recursive_paths)
 {
@@ -57,6 +56,26 @@ SENTRY_TEST(path_joining_unix)
 
     sentry__path_free(path);
 #endif
+}
+
+SENTRY_TEST(path_from_str_null)
+{
+    TEST_CHECK(NULL == sentry__path_from_str(NULL));
+    TEST_CHECK(NULL == sentry__path_from_str_n(NULL, 0));
+    TEST_CHECK(NULL == sentry__path_from_str_n(NULL, 10));
+}
+
+SENTRY_TEST(path_from_str_n_wo_null_termination)
+{
+    // provide non-null-terminated path string with buffer character at the end.
+    char path_str[] = { 't', 'e', 's', 't', 'X' };
+    sentry_path_t *test_path = sentry__path_from_str_n(path_str, 4);
+#ifdef SENTRY_PLATFORM_WINDOWS
+    TEST_CHECK_WSTRING_EQUAL(test_path->path, L"test");
+#else
+    TEST_CHECK_STRING_EQUAL(test_path->path, "test");
+#endif
+    sentry__path_free(test_path);
 }
 
 SENTRY_TEST(path_joining_windows)
@@ -152,7 +171,7 @@ SENTRY_TEST(path_directory)
 #ifdef SENTRY_PLATFORM_WINDOWS
     sentry_path_t *path_3 = sentry__path_from_str("foo/bar\\baz");
 
-    // %TEMP%\\sentry_test_unit\\ 
+    // `%TEMP%\sentry_test_unit`
     wchar_t temp_folder[MAX_PATH];
     GetEnvironmentVariableW(L"TEMP", temp_folder, sizeof(temp_folder));
     sentry_path_t *path_4 = sentry__path_from_wstr(temp_folder);

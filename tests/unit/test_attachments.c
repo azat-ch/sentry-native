@@ -2,7 +2,6 @@
 #include "sentry_path.h"
 #include "sentry_string.h"
 #include "sentry_testsupport.h"
-#include <sentry.h>
 
 typedef struct {
     uint64_t called;
@@ -10,7 +9,7 @@ typedef struct {
 } sentry_attachments_testdata_t;
 
 static void
-send_envelope(const sentry_envelope_t *envelope, void *_data)
+send_envelope_test_attachments(const sentry_envelope_t *envelope, void *_data)
 {
     sentry_attachments_testdata_t *data = _data;
     data->called += 1;
@@ -33,9 +32,11 @@ SENTRY_TEST(lazy_attachments)
     sentry_options_t *options = sentry_options_new();
     sentry_options_set_auto_session_tracking(options, false);
     sentry_options_set_dsn(options, "https://foo@sentry.invalid/42");
-    sentry_options_set_transport(
-        options, sentry_new_function_transport(send_envelope, &testdata));
-    sentry_options_set_release(options, "prod");
+    sentry_options_set_transport(options,
+        sentry_new_function_transport(
+            send_envelope_test_attachments, &testdata));
+    char rel[] = { 't', 'e', 's', 't' };
+    sentry_options_set_release_n(options, rel, sizeof(rel));
 
     sentry_options_add_attachment(options, PREFIX ".existing-file-attachment");
     sentry_options_add_attachment(
@@ -53,6 +54,7 @@ SENTRY_TEST(lazy_attachments)
 
     char *serialized
         = sentry_stringbuilder_take_string(&testdata.serialized_envelope);
+    TEST_CHECK(strstr(serialized, "\"release\":\"test\"") != NULL);
     TEST_CHECK(strstr(serialized,
                    "{\"type\":\"attachment\",\"length\":3,"
                    "\"filename\":\".existing-file-attachment\"}\n"
@@ -82,7 +84,7 @@ SENTRY_TEST(lazy_attachments)
         != NULL);
     sentry_free(serialized);
 
-    sentry_shutdown();
+    sentry_close();
 
     sentry__path_remove(existing);
     sentry__path_remove(non_existing);

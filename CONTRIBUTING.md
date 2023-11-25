@@ -12,6 +12,7 @@ Building and testing `sentry-native` currently requires the following tools:
 - **CMake** and a supported C/C++ compiler, to actually build the code.
 - **python** and **pytest**, to run integration tests.
 - **clang-format** and **black**, to format the C/C++ and python code respectively.
+- **curl** and **zlib** libraries (e.g. on Ubuntu: libcurl4-openssl-dev, libz-dev)
 
 `pytest` and `black` are installed as virtualenv dependencies automatically.
 
@@ -37,7 +38,7 @@ be done manually.
 
 Creates a python virtualenv, and runs all the tests through `pytest`.
 
-**Running integration-tests manually**:
+**Running integration tests manually**:
 
     $ pytest --verbose --maxfail=1 --capture=no tests/
 
@@ -47,13 +48,20 @@ can also be invoked directly.
 The `maxfail` parameter will abort after the first failure, and `capture=no`
 will print the complete compiler output, and test log.
 
-**Running unit-tests manually**:
+**Running unit tests**:
+
+    $ make test-unit
+
+Unit tests also have a dedicated `make` target, if they need to be run separately
+from the integration tests.
+
+**Running unit tests manually**:
 
     $ cmake -B build -D CMAKE_RUNTIME_OUTPUT_DIRECTORY=$(pwd)/build
     $ cmake --build build --target sentry_test_unit
     $ ./build/sentry_test_unit
 
-The unit-tests are a separate executable target and can be built and run on
+The unit tests are a separate executable target and can be built and run on
 their own.
 
 ## How to interpret CI failures
@@ -114,7 +122,7 @@ The example can be run manually with a variety of commands to test different
 scenarios. Additionally, it will use the `SENTRY_DSN` env-variable, and can thus
 also be used to capture events/crashes directly to sentry.
 
-The example currently supports the following commends:
+The example currently supports the following commands:
 
 - `capture-event`: Captures an event.
 - `crash`: Triggers a crash to be captured.
@@ -131,3 +139,14 @@ The example currently supports the following commends:
 - `capture-multiple`: Captures a number of events.
 - `sleep`: Introduces a 10 second sleep.
 - `add-stacktrace`: Adds the current thread stacktrace to the captured event.
+- `disable-backend`: Disables the build-configured crash-handler backend.
+- `before-send`: Installs a `before_send()` callback that retains the event.
+- `discarding-before-send`: Installs a `before_send()` callback that discards the event.
+- `on-crash`: Installs an `on_crash()` callback that retains the crash event. 
+- `discarding-on-crash`: Installs an `on_crash()` callback that discards the crash event.
+- `override-sdk-name`: Changes the SDK name via the options at runtime.
+
+Only on Windows using crashpad with its WER handler module: 
+
+- `fastfail`: Crashes the application using the `__fastfail` intrinsic directly, thus by-passing SEH.
+- `stack-buffer-overrun`: Triggers the Windows Control Flow Guard, which also fast fails and in turn by-passes SEH.

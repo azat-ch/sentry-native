@@ -62,13 +62,27 @@ bool sentry__run_clear_session(const sentry_run_t *run);
  * will be locked, and any files named  `<event-uuid>.envelope` or
  * `session.json` will be queued for sending to the  backend. The files and
  * directories matching these criteria will be deleted afterwards.
+ * The following heuristic is applied to all unclosed sessions: If the session
+ * was started before the timestamp given by `last_crash`, the session is closed
+ * as "crashed" with an appropriate duration.
  */
-void sentry__process_old_runs(const sentry_options_t *options);
+void sentry__process_old_runs(
+    const sentry_options_t *options, uint64_t last_crash);
 
 /**
  * This will write the current ISO8601 formatted timestamp into the
  * `<database>/last_crash` file.
  */
 bool sentry__write_crash_marker(const sentry_options_t *options);
+
+/**
+ * This will check whether the `<database>/last_crash` file exists.
+ */
+bool sentry__has_crash_marker(const sentry_options_t *options);
+
+/**
+ * This will remove the `<database>/last_crash` file.
+ */
+bool sentry__clear_crash_marker(const sentry_options_t *options);
 
 #endif

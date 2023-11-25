@@ -5,9 +5,14 @@ extern "C" {
 #include "sentry_backend.h"
 #include "sentry_core.h"
 #include "sentry_database.h"
+#include "sentry_envelope.h"
 #include "sentry_options.h"
 #include "sentry_path.h"
+#include "sentry_sync.h"
+#include "sentry_transport.h"
+#include "sentry_unix_pageallocator.h"
 #include "sentry_utils.h"
+#include "transports/sentry_disk_transport.h"
 }
 
 #include <map>
@@ -26,7 +31,11 @@ extern "C" {
 #include "client/crash_report_database.h"
 #include "client/crashpad_client.h"
 #include "client/crashpad_info.h"
+#include "client/prune_crash_reports.h"
 #include "client/settings.h"
+#if defined(_WIN32)
+#    include "util/win/termination_codes.h"
+#endif
 
 #if defined(__GNUC__)
 #    pragma GCC diagnostic pop
@@ -36,18 +45,46 @@ extern "C" {
 
 extern "C" {
 
+#ifdef SENTRY_PLATFORM_LINUX
+#    include <unistd.h>
+#    define SIGNAL_STACK_SIZE 65536
+static stack_t g_signal_stack;
+
+#    include "util/posix/signals.h"
+
+// This list was taken from crashpad's util/posix/signals.cc file
+// and is used to know which signals we need to reset to default
+// when shutting down the backend
+constexpr int g_CrashSignals[] = {
+    SIGABRT,
+    SIGBUS,
+    SIGFPE,
+    SIGILL,
+    SIGQUIT,
+    SIGSEGV,
+    SIGSYS,
+    SIGTRAP,
+#    if defined(SIGEMT)
+    SIGEMT,
+#    endif // defined(SIGEMT)
+    SIGXCPU,
+    SIGXFSZ,
+};
+#endif
+
 typedef struct {
     crashpad::CrashReportDatabase *db;
     sentry_path_t *event_path;
     sentry_path_t *breadcrumb1_path;
     sentry_path_t *breadcrumb2_path;
     size_t num_breadcrumbs;
+    sentry_value_t crash_event;
 } crashpad_state_t;
 
 static void
-sentry__crashpad_backend_user_consent_changed(sentry_backend_t *backend)
+crashpad_backend_user_consent_changed(sentry_backend_t *backend)
 {
-    crashpad_state_t *data = (crashpad_state_t *)backend->data;
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
     if (!data->db || !data->db->GetSettings()) {
         return;
     }
@@ -55,21 +92,31 @@ sentry__crashpad_backend_user_consent_changed(sentry_backend_t *backend)
 }
 
 static void
-sentry__crashpad_backend_flush_scope(
-    sentry_backend_t *backend, const sentry_scope_t *UNUSED(scope))
+crashpad_backend_flush_scope(
+    sentry_backend_t *backend, const sentry_options_t *options)
 {
-    const crashpad_state_t *data = (crashpad_state_t *)backend->data;
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
     if (!data->event_path) {
         return;
     }
 
     // This here is an empty object that we copy the scope into.
     // Even though the API is specific to `event`, an `event` has a few default
-    // properties that we do not want here.
-    sentry_value_t event = sentry_value_new_object();
+    // properties that we do not want here. But in case of a crash we use the
+    // crash-event filled in the crash-handler and on_crash/before_send
+    // respectively.
+    sentry_value_t event = data->crash_event;
+    if (sentry_value_is_null(event)) {
+        event = sentry_value_new_object();
+        // FIXME: This should be handled in the FirstChanceHandler but that does
+        // not exist for macOS just yet.
+        sentry_value_set_by_key(
+            event, "level", sentry__value_new_level(SENTRY_LEVEL_FATAL));
+    }
+
     SENTRY_WITH_SCOPE (scope) {
         // we want the scope without any modules or breadcrumbs
-        sentry__scope_apply_to_event(scope, event, SENTRY_SCOPE_NONE);
+        sentry__scope_apply_to_event(scope, options, event, SENTRY_SCOPE_NONE);
     }
 
     size_t mpack_size;
@@ -87,19 +134,123 @@ sentry__crashpad_backend_flush_scope(
     }
 }
 
-static void
-sentry__crashpad_backend_shutdown(sentry_backend_t *backend)
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_WINDOWS)
+#    ifdef SENTRY_PLATFORM_WINDOWS
+static bool
+sentry__crashpad_handler(EXCEPTION_POINTERS *ExceptionInfo)
 {
-    crashpad_state_t *data = (crashpad_state_t *)backend->data;
-    delete data->db;
-    data->db = nullptr;
+#    else
+static bool
+sentry__crashpad_handler(int signum, siginfo_t *info, ucontext_t *user_context)
+{
+    sentry__page_allocator_enable();
+    sentry__enter_signal_handler();
+#    endif
+    SENTRY_DEBUG("flushing session and queue before crashpad handler");
+
+    bool should_dump = true;
+
+    SENTRY_WITH_OPTIONS (options) {
+        auto *data = static_cast<crashpad_state_t *>(options->backend->data);
+        sentry_value_decref(data->crash_event);
+        data->crash_event = sentry_value_new_event();
+        sentry_value_set_by_key(data->crash_event, "level",
+            sentry__value_new_level(SENTRY_LEVEL_FATAL));
+
+        if (options->on_crash_func) {
+            sentry_ucontext_t uctx;
+#    ifdef SENTRY_PLATFORM_WINDOWS
+            uctx.exception_ptrs = *ExceptionInfo;
+#    else
+            uctx.signum = signum;
+            uctx.siginfo = info;
+            uctx.user_context = user_context;
+#    endif
+
+            SENTRY_TRACE("invoking `on_crash` hook");
+            data->crash_event = options->on_crash_func(
+                &uctx, data->crash_event, options->on_crash_data);
+        } else if (options->before_send_func) {
+            SENTRY_TRACE("invoking `before_send` hook");
+            data->crash_event = options->before_send_func(
+                data->crash_event, nullptr, options->before_send_data);
+        }
+        should_dump = !sentry_value_is_null(data->crash_event);
+
+        if (should_dump) {
+            crashpad_backend_flush_scope(options->backend, options);
+
+            sentry__write_crash_marker(options);
+
+            sentry__record_errors_on_current_session(1);
+            sentry_session_t *session = sentry__end_current_session_with_status(
+                SENTRY_SESSION_STATUS_CRASHED);
+            if (session) {
+                sentry_envelope_t *envelope = sentry__envelope_new();
+                sentry__envelope_add_session(envelope, session);
+
+                // capture the envelope with the disk transport
+                sentry_transport_t *disk_transport
+                    = sentry_new_disk_transport(options->run);
+                sentry__capture_envelope(disk_transport, envelope);
+                sentry__transport_dump_queue(disk_transport, options->run);
+                sentry_transport_free(disk_transport);
+            }
+        } else {
+            SENTRY_TRACE("event was discarded");
+        }
+        sentry__transport_dump_queue(options->transport, options->run);
+    }
+
+    SENTRY_DEBUG("handing control over to crashpad");
+#    ifndef SENTRY_PLATFORM_WINDOWS
+    sentry__leave_signal_handler();
+#    endif
+
+    // If we __don't__ want a minidump produced by crashpad we need to either
+    // exit or longjmp at this point. The crashpad client handler which calls
+    // back here (SetFirstChanceExceptionHandler) does the same if the
+    // application is not shutdown via the crashpad_handler process.
+    //
+    // If we would return `true` here without changing any of the global signal-
+    // handling state or rectifying the cause of the signal, this would turn
+    // into a signal-handler/exception-filter loop, because some
+    // signals/exceptions (like SIGSEGV) are unrecoverable.
+    //
+    // Ideally the SetFirstChanceExceptionHandler would accept more than a
+    // boolean to differentiate between:
+    //
+    // * we accept our fate and want a minidump (currently returning `false`)
+    // * we accept our fate and don't want a minidump (currently not available)
+    // * we rectified the situation, so crashpads signal-handler can simply
+    //   return, thereby letting the not-rectified signal-cause trigger a
+    //   signal-handler/exception-filter again, which probably leads to us
+    //   (currently returning `true`)
+    //
+    // TODO(supervacuus):
+    // * we need integration tests for more signal/exception types not only
+    //   for unmapped memory access (which is the current crash in example.c).
+    // * we should adapt the SetFirstChanceExceptionHandler interface in
+    // crashpad
+    if (!should_dump) {
+#    ifdef SENTRY_PLATFORM_WINDOWS
+        TerminateProcess(GetCurrentProcess(),
+            crashpad::TerminationCodes::kTerminationCodeCrashNoDump);
+#    else
+        _exit(EXIT_FAILURE);
+#    endif
+    }
+
+    // we did not "handle" the signal, so crashpad should do that.
+    return false;
 }
+#endif
 
 static int
-sentry__crashpad_backend_startup(
+crashpad_backend_startup(
     sentry_backend_t *backend, const sentry_options_t *options)
 {
-    sentry_path_t *owned_handler_path = NULL;
+    sentry_path_t *owned_handler_path = nullptr;
     sentry_path_t *handler_path = options->handler_path;
     if (!handler_path) {
         sentry_path_t *current_exe = sentry__path_current_exe();
@@ -137,11 +288,10 @@ sentry__crashpad_backend_startup(
                   "\"%" SENTRY_PATH_PRI "\"",
         absolute_handler_path->path);
     sentry_path_t *current_run_folder = options->run->run_path;
-    crashpad_state_t *data = (crashpad_state_t *)backend->data;
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
 
     base::FilePath database(options->database_path->path);
     base::FilePath handler(absolute_handler_path->path);
-    sentry__path_free(absolute_handler_path);
 
     std::map<std::string, std::string> annotations;
     std::vector<base::FilePath> attachments;
@@ -149,7 +299,7 @@ sentry__crashpad_backend_startup(
     // register attachments
     for (sentry_attachment_t *attachment = options->attachments; attachment;
          attachment = attachment->next) {
-        attachments.push_back(base::FilePath(attachment->path->path));
+        attachments.emplace_back(attachment->path->path);
     }
 
     // and add the serialized event, and two rotating breadcrumb files
@@ -165,25 +315,72 @@ sentry__crashpad_backend_startup(
     sentry__path_touch(data->breadcrumb1_path);
     sentry__path_touch(data->breadcrumb2_path);
 
-    attachments.push_back(base::FilePath(data->event_path->path));
-    attachments.push_back(base::FilePath(data->breadcrumb1_path->path));
-    attachments.push_back(base::FilePath(data->breadcrumb2_path->path));
+    attachments.insert(attachments.end(),
+        { base::FilePath(data->event_path->path),
+            base::FilePath(data->breadcrumb1_path->path),
+            base::FilePath(data->breadcrumb2_path->path) });
 
-    std::vector<std::string> arguments;
-    arguments.push_back("--no-rate-limit");
+    std::vector<std::string> arguments { "--no-rate-limit" };
 
     // Initialize database first, flushing the consent later on as part of
     // `sentry_init` will persist the upload flag.
     data->db = crashpad::CrashReportDatabase::Initialize(database).release();
 
+    bool success;
     crashpad::CrashpadClient client;
-    char *minidump_url = sentry__dsn_get_minidump_url(options->dsn);
-    SENTRY_TRACEF("using minidump url \"%s\"", minidump_url);
-    std::string url = minidump_url ? std::string(minidump_url) : std::string();
-    sentry_free(minidump_url);
-    bool success = client.StartHandler(handler, database, database, url,
-        annotations, arguments, /* restartable */ true,
-        /* asynchronous_start */ false, attachments);
+    char *minidump_url
+        = sentry__dsn_get_minidump_url(options->dsn, options->user_agent);
+    if (minidump_url) {
+        SENTRY_TRACEF("using minidump URL \"%s\"", minidump_url);
+        success = client.StartHandler(handler, database, database, minidump_url,
+            options->http_proxy ? options->http_proxy : "", annotations,
+            arguments,
+            /* restartable */ true,
+            /* asynchronous_start */ false, attachments);
+        sentry_free(minidump_url);
+    } else {
+        SENTRY_WARN(
+            "failed to construct minidump URL (check DSN or user-agent)");
+        delete data->db;
+        data->db = nullptr;
+        return 1;
+    }
+
+#ifdef CRASHPAD_WER_ENABLED
+    sentry_path_t *handler_dir = sentry__path_dir(absolute_handler_path);
+    sentry_path_t *wer_path = nullptr;
+    if (handler_dir) {
+        wer_path = sentry__path_join_str(handler_dir, "crashpad_wer.dll");
+        sentry__path_free(handler_dir);
+    }
+
+    if (wer_path && sentry__path_is_file(wer_path)) {
+        SENTRY_TRACEF("registering crashpad WER handler "
+                      "\"%" SENTRY_PATH_PRI "\"",
+            wer_path->path);
+
+        // The WER handler needs to be registered in the registry first.
+        DWORD dwOne = 1;
+        LSTATUS reg_res = RegSetKeyValueW(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\Windows Error Reporting\\"
+            L"RuntimeExceptionHelperModules",
+            wer_path->path, REG_DWORD, &dwOne, sizeof(DWORD));
+        if (reg_res != ERROR_SUCCESS) {
+            SENTRY_WARN("registering crashpad WER handler in registry failed");
+        } else {
+            std::wstring wer_path_string(wer_path->path);
+            if (!client.RegisterWerModule(wer_path_string)) {
+                SENTRY_WARN("registering crashpad WER handler module failed");
+            }
+        }
+
+        sentry__path_free(wer_path);
+    } else {
+        SENTRY_WARN("crashpad WER handler module not found");
+    }
+#endif // CRASHPAD_WER_ENABLED
+
+    sentry__path_free(absolute_handler_path);
 
     if (success) {
         SENTRY_DEBUG("started crashpad client handler");
@@ -194,6 +391,23 @@ sentry__crashpad_backend_startup(
         data->db = nullptr;
         return 1;
     }
+
+#if defined(SENTRY_PLATFORM_LINUX) || defined(SENTRY_PLATFORM_WINDOWS)
+    crashpad::CrashpadClient::SetFirstChanceExceptionHandler(
+        &sentry__crashpad_handler);
+#endif
+#ifdef SENTRY_PLATFORM_LINUX
+    // Crashpad was recently changed to register its own signal stack, which for
+    // whatever reason is not compatible with our own handler. so we override
+    // that stack yet again to be able to correctly flush things out.
+    // https://github.com/getsentry/crashpad/commit/06a688ddc1bc8be6f410e69e4fb413fc19594d04
+    g_signal_stack.ss_sp = sentry_malloc(SIGNAL_STACK_SIZE);
+    if (g_signal_stack.ss_sp) {
+        g_signal_stack.ss_size = SIGNAL_STACK_SIZE;
+        g_signal_stack.ss_flags = 0;
+        sigaltstack(&g_signal_stack, 0);
+    }
+#endif
 
     if (!options->system_crash_reporter_enabled) {
         // Disable the system crash reporter. Especially on macOS, it takes
@@ -207,16 +421,44 @@ sentry__crashpad_backend_startup(
 }
 
 static void
-sentry__crashpad_backend_add_breadcrumb(
-    sentry_backend_t *backend, sentry_value_t breadcrumb)
+crashpad_backend_shutdown(sentry_backend_t *backend)
 {
-    crashpad_state_t *data = (crashpad_state_t *)backend->data;
+#ifdef SENTRY_PLATFORM_LINUX
+    // restore signal handlers to their default state
+    for (const auto signal : g_CrashSignals) {
+        if (crashpad::Signals::IsCrashSignal(signal)) {
+            crashpad::Signals::InstallDefaultHandler(signal);
+        }
+    }
+#endif
 
-    bool first_breadcrumb = data->num_breadcrumbs % SENTRY_BREADCRUMBS_MAX == 0;
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
+    delete data->db;
+    data->db = nullptr;
+
+#ifdef SENTRY_PLATFORM_LINUX
+    g_signal_stack.ss_flags = SS_DISABLE;
+    sigaltstack(&g_signal_stack, 0);
+    sentry_free(g_signal_stack.ss_sp);
+    g_signal_stack.ss_sp = NULL;
+#endif
+}
+
+static void
+crashpad_backend_add_breadcrumb(sentry_backend_t *backend,
+    sentry_value_t breadcrumb, const sentry_options_t *options)
+{
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
+
+    size_t max_breadcrumbs = options->max_breadcrumbs;
+    if (!max_breadcrumbs) {
+        return;
+    }
+
+    bool first_breadcrumb = data->num_breadcrumbs % max_breadcrumbs == 0;
 
     const sentry_path_t *breadcrumb_file
-        = data->num_breadcrumbs % (SENTRY_BREADCRUMBS_MAX * 2)
-            < SENTRY_BREADCRUMBS_MAX
+        = data->num_breadcrumbs % (max_breadcrumbs * 2) < max_breadcrumbs
         ? data->breadcrumb1_path
         : data->breadcrumb2_path;
     data->num_breadcrumbs++;
@@ -226,7 +468,6 @@ sentry__crashpad_backend_add_breadcrumb(
 
     size_t mpack_size;
     char *mpack = sentry_value_to_msgpack(breadcrumb, &mpack_size);
-    sentry_value_decref(breadcrumb);
     if (!mpack) {
         return;
     }
@@ -242,17 +483,18 @@ sentry__crashpad_backend_add_breadcrumb(
 }
 
 static void
-sentry__crashpad_backend_free(sentry_backend_t *backend)
+crashpad_backend_free(sentry_backend_t *backend)
 {
-    crashpad_state_t *data = (crashpad_state_t *)backend->data;
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
     sentry__path_free(data->event_path);
     sentry__path_free(data->breadcrumb1_path);
     sentry__path_free(data->breadcrumb2_path);
+    sentry_value_decref(data->crash_event);
     sentry_free(data);
 }
 
 static void
-sentry__crashpad_backend_except(
+crashpad_backend_except(
     sentry_backend_t *UNUSED(backend), const sentry_ucontext_t *context)
 {
 #ifdef SENTRY_PLATFORM_WINDOWS
@@ -265,29 +507,83 @@ sentry__crashpad_backend_except(
 #endif
 }
 
+static void
+report_crash_time(
+    uint64_t *crash_time, const crashpad::CrashReportDatabase::Report &report)
+{
+    // we do a `+ 1` here, because crashpad timestamps are second resolution,
+    // but our sessions are ms resolution. at least in our integration tests, we
+    // can have a session that starts at, e.g. `0.471`, whereas the crashpad
+    // report will be `0`, which would mean our heuristic does not trigger due
+    // to rounding.
+    uint64_t time = ((uint64_t)report.creation_time + 1) * 1000;
+    if (time > *crash_time) {
+        *crash_time = time;
+    }
+}
+
+static uint64_t
+crashpad_backend_last_crash(sentry_backend_t *backend)
+{
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
+
+    uint64_t crash_time = 0;
+
+    std::vector<crashpad::CrashReportDatabase::Report> reports;
+    if (data->db->GetCompletedReports(&reports)
+        == crashpad::CrashReportDatabase::kNoError) {
+        for (const crashpad::CrashReportDatabase::Report &report : reports) {
+            report_crash_time(&crash_time, report);
+        }
+    }
+
+    return crash_time;
+}
+
+static void
+crashpad_backend_prune_database(sentry_backend_t *backend)
+{
+    auto *data = static_cast<crashpad_state_t *>(backend->data);
+
+    // We want to eagerly clean up reports older than 2 days, and limit the
+    // complete database to a maximum of 8M. That might still be a lot for
+    // an embedded use-case, but minidumps on desktop can sometimes be quite
+    // large.
+    data->db->CleanDatabase(60 * 60 * 24 * 2);
+    crashpad::BinaryPruneCondition condition(crashpad::BinaryPruneCondition::OR,
+        new crashpad::DatabaseSizePruneCondition(1024 * 8),
+        new crashpad::AgePruneCondition(2));
+    crashpad::PruneCrashReportDatabase(data->db, &condition);
+}
+
 sentry_backend_t *
 sentry__backend_new(void)
 {
-    sentry_backend_t *backend = SENTRY_MAKE(sentry_backend_t);
+    auto *backend = SENTRY_MAKE(sentry_backend_t);
     if (!backend) {
-        return NULL;
+        return nullptr;
     }
-    crashpad_state_t *data = SENTRY_MAKE(crashpad_state_t);
+    memset(backend, 0, sizeof(sentry_backend_t));
+
+    auto *data = SENTRY_MAKE(crashpad_state_t);
     if (!data) {
         sentry_free(backend);
-        return NULL;
+        return nullptr;
     }
     memset(data, 0, sizeof(crashpad_state_t));
+    data->crash_event = sentry_value_new_null();
 
-    backend->startup_func = sentry__crashpad_backend_startup;
-    backend->shutdown_func = sentry__crashpad_backend_shutdown;
-    backend->except_func = sentry__crashpad_backend_except;
-    backend->free_func = sentry__crashpad_backend_free;
-    backend->flush_scope_func = sentry__crashpad_backend_flush_scope;
-    backend->add_breadcrumb_func = sentry__crashpad_backend_add_breadcrumb;
-    backend->user_consent_changed_func
-        = sentry__crashpad_backend_user_consent_changed;
+    backend->startup_func = crashpad_backend_startup;
+    backend->shutdown_func = crashpad_backend_shutdown;
+    backend->except_func = crashpad_backend_except;
+    backend->free_func = crashpad_backend_free;
+    backend->flush_scope_func = crashpad_backend_flush_scope;
+    backend->add_breadcrumb_func = crashpad_backend_add_breadcrumb;
+    backend->user_consent_changed_func = crashpad_backend_user_consent_changed;
+    backend->get_last_crash_func = crashpad_backend_last_crash;
+    backend->prune_database_func = crashpad_backend_prune_database;
     backend->data = data;
+    backend->can_capture_after_shutdown = true;
 
     return backend;
 }

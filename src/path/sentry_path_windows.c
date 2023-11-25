@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
-#include <shlwapi.h>
+#include <stdlib.h>
 #include <sys/locking.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -124,19 +124,37 @@ sentry__path_dir(const sentry_path_t *path)
     if (!dir_path) {
         return NULL;
     }
-    PathRemoveFileSpecW(dir_path->path);
+
+    // find the filename part and truncate just in front of it if possible
+    sentry_pathchar_t *filename
+        = (sentry_pathchar_t *)sentry__path_filename(dir_path);
+    if (filename > dir_path->path) {
+        *(filename - 1) = L'\0';
+    }
     return dir_path;
+}
+
+sentry_path_t *
+sentry__path_from_wstr_n(const wchar_t *s, size_t s_len)
+{
+    if (!s) {
+        return NULL;
+    }
+    sentry_path_t *rv = path_with_len(s_len + 1);
+    if (rv) {
+        memcpy(rv->path, s, s_len * sizeof(wchar_t));
+        rv->path[s_len] = 0;
+    }
+    return rv;
 }
 
 sentry_path_t *
 sentry__path_from_wstr(const wchar_t *s)
 {
-    size_t len = wcslen(s) + 1;
-    sentry_path_t *rv = path_with_len(len);
-    if (rv) {
-        memcpy(rv->path, s, len * sizeof(wchar_t));
+    if (!s) {
+        return NULL;
     }
-    return rv;
+    return sentry__path_from_wstr_n(s, wcslen(s));
 }
 
 sentry_path_t *
@@ -183,20 +201,42 @@ sentry__path_join_wstr(const sentry_path_t *base, const wchar_t *other)
 }
 
 sentry_path_t *
-sentry__path_from_str(const char *s)
+sentry__path_from_str_n(const char *s, size_t s_len)
 {
-    size_t len = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+    if (!s) {
+        return NULL;
+    }
     sentry_path_t *rv = SENTRY_MAKE(sentry_path_t);
     if (!rv) {
         return NULL;
     }
-    rv->path = sentry_malloc(sizeof(wchar_t) * len);
+    size_t src_size = sizeof(char) * s_len;
+    size_t dst_size = sizeof(wchar_t) * (s_len + 1);
+    rv->path = sentry_malloc(dst_size);
     if (!rv->path) {
-        sentry_free(rv);
+        goto error;
+    }
+    int conv_len = MultiByteToWideChar(
+        CP_ACP, 0, s, (int)src_size, rv->path, (int)s_len);
+    if (conv_len == 0) {
+        goto error;
+    }
+    rv->path[conv_len] = 0;
+    return rv;
+
+error:
+    sentry_free(rv);
+    return NULL;
+}
+
+sentry_path_t *
+sentry__path_from_str(const char *s)
+{
+    if (!s) {
         return NULL;
     }
-    MultiByteToWideChar(CP_ACP, 0, s, -1, rv->path, (int)len);
-    return rv;
+
+    return sentry__path_from_str_n(s, strlen(s));
 }
 
 sentry_path_t *
@@ -215,7 +255,7 @@ sentry__path_filename(const sentry_path_t *path)
     size_t idx = wcslen(s);
 
     while (true) {
-        if (s[idx] == L'/' || s[idx] == '\\') {
+        if (s[idx] == L'/' || s[idx] == L'\\') {
             ptr = s + idx + 1;
             break;
         }
@@ -406,6 +446,7 @@ sentry__pathiter_next(sentry_pathiter_t *piter)
             pattern[path_len + 1] = L'*';
             pattern[path_len + 2] = 0;
             piter->dir_handle = FindFirstFileW(pattern, &data);
+            sentry_free(pattern);
             if (piter->dir_handle == INVALID_HANDLE_VALUE) {
                 return NULL;
             }
@@ -483,7 +524,7 @@ sentry__path_read_to_buffer(const sentry_path_t *path, size_t *size_out)
 
     size_t remaining = len;
     size_t offset = 0;
-    while (true) {
+    while (remaining > 0) {
         size_t n = fread(rv + offset, 1, remaining, f);
         if (n == 0) {
             break;
@@ -527,5 +568,5 @@ int
 sentry__path_append_buffer(
     const sentry_path_t *path, const char *buf, size_t buf_len)
 {
-    return write_buffer_with_mode(path, buf, buf_len, L"a");
+    return write_buffer_with_mode(path, buf, buf_len, L"ab");
 }
