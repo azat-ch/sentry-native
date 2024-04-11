@@ -55,6 +55,8 @@ endif()
 
 option(SENTRY_PIC "Build sentry (and dependent) libraries as position independent libraries" ON)
 
+option(SENTRY_ENABLE_PAGE_ALLOCATOR "Enable page allocator (does not works on non-unix)" ${CMAKE_HOST_UNIX})
+
 option(SENTRY_BUILD_TESTS "Build sentry-native tests" "${SENTRY_MAIN_PROJECT}")
 option(SENTRY_BUILD_EXAMPLES "Build sentry-native example(s)" "${SENTRY_MAIN_PROJECT}")
 
@@ -291,6 +293,10 @@ if(SENTRY_TRANSPORT_CURL)
 		target_link_libraries(sentry PRIVATE $<BUILD_INTERFACE:${GENEX_CURL_LIBRARIES}>)
 		target_compile_definitions(sentry PRIVATE $<BUILD_INTERFACE:${GENEX_CURL_COMPILE_DEFINITIONS}>)
 	endif()
+endif()
+
+if(SENTRY_ENABLE_PAGE_ALLOCATOR)
+	target_compile_definitions(sentry PRIVATE SENTRY_ENABLE_PAGE_ALLOCATOR)
 endif()
 
 set_property(TARGET sentry PROPERTY C_VISIBILITY_PRESET hidden)
